@@ -1,0 +1,64 @@
+name: Build Quackback release
+# Compila Quackback (necesita >4 GB de RAM) y publica un .tar.gz listo para Pterodactyl.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Rama, tag o commit de QuackbackIO/quackback"
+        default: main
+      runner:
+        description: "Arquitectura del servidor Pterodactyl"
+        type: choice
+        default: ubuntu-24.04-arm   # arm64
+        options: [ubuntu-24.04-arm, ubuntu-latest]   # ubuntu-latest = x64
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: QuackbackIO/quackback
+          ref: ${{ inputs.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Install
+        run: bun install --frozen-lockfile
+        env: { HUSKY: "0" }
+
+      - name: Build widget (obligatorio antes de la web)
+        run: bun run --filter @quackback/widget build
+        env: { NODE_ENV: production }
+
+      - name: Build web
+        working-directory: apps/web
+        run: bun run build
+        env: { NODE_ENV: production }
+
+      - name: Bundle migrations
+        run: bun build packages/db/src/migrate.ts --target=bun --bundle --outfile=release/migrate.mjs
+
+      - name: Assemble release
+        run: |
+          cp -r apps/web/.output release/.output
+          cp -r packages/db/drizzle release/drizzle
+          tar -czf quackback-release.tar.gz -C release .
+          ls -lh quackback-release.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quackback-release
+          path: quackback-release.tar.gz
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Quackback build ${{ github.run_number }}
+          files: quackback-release.tar.gz
