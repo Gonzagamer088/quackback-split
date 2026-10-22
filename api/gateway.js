@@ -11,7 +11,10 @@ const CACHE_RE = new RegExp(process.env.IMMUTABLE_PATH_REGEX || '^/assets/');
 const MAX_BODY = 4 * 1024 * 1024; // límite de Vercel ≈ 4.5 MB
 
 const DROP_REQ = new Set(['host', 'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'content-length', 'accept-encoding', 'proxy-authorization']);
-const DROP_RES = new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-length', 'content-encoding', 'te', 'trailer', 'upgrade']);
+const DROP_RES = new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-length', 'te', 'trailer', 'upgrade']);
+// Conexiones reutilizables entre invocaciones calientes (evita el handshake TCP en cada petición)
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64, rejectUnauthorized: !ALLOW_SELF_SIGNED });
 
 let keys;
 function readBody(req) {
@@ -29,7 +32,7 @@ function post(url, body) {
   return new Promise((resolve, reject) => {
     const r = lib.request({
       hostname: u.hostname, port: u.port || undefined, path: u.pathname, method: 'POST', timeout: 28_000,
-      rejectUnauthorized: !ALLOW_SELF_SIGNED,
+      agent: u.protocol === 'https:' ? httpsAgent : httpAgent,
       headers: { 'content-type': 'application/octet-stream', 'content-length': body.length },
     }, (res) => {
       const chunks = [];
@@ -58,12 +61,17 @@ async function diag(req, res, u) {
   const out = { ok: false, reqUrl: req.url, host: req.headers.host, hasOriginUrl: !!ORIGIN, hasTunnelSecret: !!SECRET };
   try {
     keys = keys || deriveKeys(SECRET);
-    const t0 = Date.now();
-    const { nonce, frame } = packRequest(keys, { method: 'GET', path: '/api/health/live', headers: { host: req.headers.host }, ip: '' }, Buffer.alloc(0));
-    const r = await post(ORIGIN.replace(/\/$/, '') + '/__tunnel/v1', frame);
-    out.tunnelHttpStatus = r.status;
-    if (r.status === 200) { const m = unpackResponse(keys, nonce, r.body).meta; out.appHealthStatus = m.status; out.ok = m.status === 200; }
-    out.ms = Date.now() - t0;
+    const times = [];
+    for (let i = 0; i < 2; i++) {   // 1ª puede incluir conexión nueva; 2ª usa keep-alive
+      const t0 = Date.now();
+      const { nonce, frame } = packRequest(keys, { method: 'GET', path: '/api/health/live', headers: { host: req.headers.host }, ip: '' }, Buffer.alloc(0));
+      const r = await post(ORIGIN.replace(/\/$/, '') + '/__tunnel/v1', frame);
+      out.tunnelHttpStatus = r.status;
+      if (r.status === 200) { const m = unpackResponse(keys, nonce, r.body).meta; out.appHealthStatus = m.status; out.ok = m.status === 200; }
+      times.push(Date.now() - t0);
+    }
+    out.tunnelRoundTripMs = { first: times[0], second: times[1] };   // Vercel <-> backend, sin base de datos
+    out.vercelRegion = process.env.VERCEL_REGION || null;
   } catch (e) { out.error = e.message; }
   res.statusCode = 200;
   res.setHeader('content-type', 'application/json');
@@ -89,7 +97,8 @@ module.exports = async (req, res) => {
       headers[l] = v;
     }
     headers.host = req.headers.host;       // el dominio público de Vercel (= BASE_URL)
-    headers['accept-encoding'] = 'identity';
+    // gzip de extremo a extremo: el contenido viaja comprimido y se entrega tal cual al navegador
+    headers['accept-encoding'] = /\bgzip\b/i.test(String(req.headers['accept-encoding'] || '')) ? 'gzip' : 'identity';
     const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 
     const body = ['GET', 'HEAD'].includes(req.method) ? Buffer.alloc(0) : await readBody(req);
